@@ -982,6 +982,21 @@ async function nadacPrice(args: Record<string, unknown>) {
     distinct_ndcs_this_week: seen.size,
     count: rows.length,
     prices: rows,
+    // Measured (fleet #2324): nadac_price is the #6 single-tool entry point
+    // in 30d, 46 distinct external callers who stop after one week's price
+    // and never ask whether that price moved. nadac_history is the same
+    // dataset, keyed by ndc — pre-fill from the top row this call already
+    // resolved (rows[0].ndc), the same way a caller comparing prices across
+    // NDCs would pick the first hit to drill into.
+    ...(rows.length > 0 && rows[0].ndc
+      ? {
+          next: {
+            tool: 'nadac_history',
+            args: { ndc: rows[0].ndc },
+            why: 'Weekly price history for this NDC — has it gone up, is this a shortage-driven spike, generic erosion since patent expiry.',
+          },
+        }
+      : {}),
   };
 }
 
