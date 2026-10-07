@@ -1023,6 +1023,11 @@ async function nadacPrice(args: Record<string, unknown>) {
     // dataset, keyed by ndc — pre-fill from the top row this call already
     // resolved (rows[0].ndc), the same way a caller comparing prices across
     // NDCs would pick the first hit to drill into.
+    //
+    // 14d re-measure (fleet #2325, 2026-10-07, same methodology as above):
+    // single-tool-only callers 46 -> 46, total callers 47 -> 47 — FLAT,
+    // nearly the identical population both windows. No movement either way;
+    // say so rather than spin it. Full comparison in the fleet #2325 close.
     ...(rows.length > 0 && rows[0].ndc
       ? {
           next: {
