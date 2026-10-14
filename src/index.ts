@@ -941,7 +941,193 @@ function compactNadac(r: any) {
   };
 }
 
+// ---- generic <-> brand crosswalk (fleet #3057) ---------------------------
+//
+// Both nadac_price and asp_payment_limit match a caller's `drug` string
+// against a short text descriptor (NADAC's ndc_description, CMS's
+// short_description), and those descriptors use WHICHEVER name the publisher
+// happened to pick — a plain substring search fails hard the moment the
+// caller's name and the descriptor's name disagree:
+//   - NADAC lists BRAND products under the BRAND name and generics under the
+//     INGREDIENT name ("apixaban" -> 0 rows, "Eliquis" -> 6 rows — this was
+//     already known and commented above, just never fixed).
+//   - CMS's HCPCS short description for a newer biologic is often the BRAND
+//     name alone ("Inj, elahere, 1 mg" has no "mirvetuximab" anywhere in it),
+//     the mirror image of the NADAC case.
+// A caller who knows one name and not the other got a confident, silent
+// "no match" (empty_reason: no_match) instead of the answer sitting one name
+// away. RxNorm (NLM, keyless, public REST) is the standard normalized name
+// graph for exactly this: resolve the caller's term to a concept (rxcui),
+// then read back every brand name (BN) and ingredient/precise-ingredient
+// name (IN/PIN) linked to it, and retry the same descriptor search with each.
+//
+// Best-effort by design: an RxNorm outage or an unrecognised term must
+// degrade to an empty candidate list, never throw — the pack's own data is
+// unaffected either way.
+
+/** FDA biologic/biosimilar suffix: a dash + 3-5 lowercase letters tacked onto
+ * a nonproprietary name to distinguish a biosimilar from its originator
+ * ("mirvetuximab soravtansine-gynx", "trastuzumab-dkst"). Stripping it is a
+ * free, no-network first guess — some CMS/NADAC descriptors carry the base
+ * ingredient name without the suffix. */
+function stripBiologicSuffix(name: string): string | null {
+  const m = name.match(/^(.*\S)-[a-z]{3,5}$/i);
+  return m ? m[1].trim() : null;
+}
+
+function dedupeCI(items: string[], exclude: string): string[] {
+  const seen = new Set<string>([exclude.trim().toLowerCase()]);
+  const out: string[] = [];
+  for (const it of items) {
+    const key = it.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it.trim());
+  }
+  return out;
+}
+
+const rxnormCache = new Map<string, { brands: string[]; ingredients: string[]; at: number }>();
+
+/** Read the BN (brand) and IN/PIN (ingredient) names related to one rxcui.
+ *  Returns empty arrays — never throws — on any failure or an rxcui with no
+ *  relations at all. */
+async function rxnormRelated(rxcui: string): Promise<{ brands: string[]; ingredients: string[] }> {
+  try {
+    const related = await getJson(`https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/allrelated.json`);
+    const groups = related?.allRelatedGroup?.conceptGroup ?? [];
+    const brands: string[] = [];
+    const ingredients: string[] = [];
+    for (const g of groups) {
+      const names = (g?.conceptProperties ?? []).map((p: any) => String(p?.name ?? '')).filter(Boolean);
+      if (g?.tty === 'BN') brands.push(...names);
+      if (g?.tty === 'IN' || g?.tty === 'PIN') ingredients.push(...names);
+    }
+    return { brands, ingredients };
+  } catch {
+    return { brands: [], ingredients: [] };
+  }
+}
+
+/** Resolve one drug name to its RxNorm brand names (BN) and
+ *  ingredient/precise-ingredient names (IN/PIN). Never throws.
+ *
+ * TRAP (fleet #3057, found only once this shipped and ran against the real
+ * RxNorm API): the FIRST-ranked rxcui is not always the USEFUL one. For
+ * "mirvetuximab" (the caller's generic name, missing its "soravtansine"
+ * modifier), approximateTerm's rank-1 hit is rxcui 2471640 — a bare
+ * "Mirvetuximab" concept sourced only from DRUGBANK with ZERO RxNorm
+ * relations (every conceptGroup in its allrelated.json is empty). The
+ * concept that actually carries the brand name (rxcui 2621548, "mirvetuximab
+ * soravtansine", BN "Elahere") ranks #2 and was never reached because the
+ * old code took the first match found (or the first RXNORM-sourced one) and
+ * stopped — a resolved-but-empty rxcui is worse than no match if it ends the
+ * search. So: collect several ranked candidate rxcuis (exact match first,
+ * then approximate, deduplicated, order preserved) and walk them in order
+ * until one actually HAS related names, rather than trusting the top rank. */
+async function rxnormCandidates(term: string): Promise<{ brands: string[]; ingredients: string[] }> {
+  const key = term.trim().toLowerCase();
+  if (!key) return { brands: [], ingredients: [] };
+  const cached = rxnormCache.get(key);
+  if (cached && Date.now() - cached.at < 24 * 3_600_000) return { brands: cached.brands, ingredients: cached.ingredients };
+
+  const rxcuis: string[] = [];
+  const addRxcui = (id: unknown) => {
+    const s = id ? String(id) : '';
+    if (s && !rxcuis.includes(s)) rxcuis.push(s);
+  };
+
+  try {
+    // search=2: RxNorm's normalized-string match (case/whitespace-insensitive).
+    const exact = await getJson(`https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodeURIComponent(term)}&search=2`);
+    const ids = exact?.idGroup?.rxnormId;
+    if (Array.isArray(ids)) for (const id of ids) addRxcui(id);
+  } catch { /* fall through to approximate match */ }
+
+  try {
+    // maxEntries=20, not the RxNorm default of a handful: the useful ingredient
+    // concept can rank below a dead-end one from a non-RxNorm source (see the
+    // header). A bigger candidate list costs nothing extra in round trips —
+    // this is still ONE request — only in how many of them get walked below.
+    const approx = await getJson(`https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(term)}&maxEntries=20`);
+    const candidates = approx?.approximateGroup?.candidate;
+    if (Array.isArray(candidates)) {
+      // RXNORM-sourced hits first (they are the ones with real relations),
+      // preserving each group's original rank order; non-RXNORM hits after,
+      // as a last resort.
+      for (const c of candidates) if (c?.source === 'RXNORM') addRxcui(c?.rxcui);
+      for (const c of candidates) if (c?.source !== 'RXNORM') addRxcui(c?.rxcui);
+    }
+  } catch { /* no RxNorm concept found for this term; rxcuis stays as-is */ }
+
+  let brands: string[] = [];
+  let ingredients: string[] = [];
+  // Bounded walk: try candidate rxcuis in order until one actually has
+  // relations. Capped at 5 — RxNorm's own rank order means a useful concept
+  // is almost never further down than that, and this path only runs at all
+  // when the direct descriptor search already missed.
+  for (const rxcui of rxcuis.slice(0, 5)) {
+    const rel = await rxnormRelated(rxcui);
+    if (rel.brands.length || rel.ingredients.length) {
+      brands = rel.brands;
+      ingredients = rel.ingredients;
+      break;
+    }
+  }
+
+  brands = dedupeCI(brands, term);
+  ingredients = dedupeCI(ingredients, term);
+  rxnormCache.set(key, { brands, ingredients, at: Date.now() });
+  return { brands, ingredients };
+}
+
+/** Build the ordered list of alternate names worth retrying a descriptor
+ *  search with, cheapest first: the suffix-stripped form (no network), then
+ *  RxNorm brand names, then RxNorm ingredient names (covers a typo the
+ *  approximate match silently corrected). */
+async function nameCandidates(term: string): Promise<{ candidates: string[]; brands: string[] }> {
+  const out: string[] = [];
+  const stripped = stripBiologicSuffix(term);
+  if (stripped && stripped.toLowerCase() !== term.toLowerCase()) out.push(stripped);
+  const { brands, ingredients } = await rxnormCandidates(term);
+  for (const b of brands) if (!out.some((x) => x.toLowerCase() === b.toLowerCase())) out.push(b);
+  for (const i of ingredients) if (!out.some((x) => x.toLowerCase() === i.toLowerCase()) && i.toLowerCase() !== term.toLowerCase()) out.push(i);
+  return { candidates: out, brands };
+}
+
 // ---- tools ---------------------------------------------------------------
+
+/** One datastore query for a given search term (name or NDC), already sorted
+ *  newest-first. Shared so a crosswalk retry (a different TERM, same shape of
+ *  query) does not duplicate the param-building. */
+async function queryNadacTerm(ds: { id: string }, opts: { ndc?: string; name?: string; asOf?: string | null }): Promise<any[]> {
+  const p: Record<string, string> = {
+    // Over-fetch: one NDC has many weeks, so `limit` results would all be the
+    // same product. Pull a deep sorted slice and reduce to the newest week here.
+    limit: '500',
+    'sorts[0][property]': 'effective_date',
+    'sorts[0][order]': 'desc',
+  };
+  let i = 0;
+  if (opts.ndc) {
+    p[`conditions[${i}][property]`] = 'ndc';
+    p[`conditions[${i}][operator]`] = '=';
+    p[`conditions[${i}][value]`] = opts.ndc;
+    i++;
+  } else if (opts.name) {
+    p[`conditions[${i}][property]`] = 'ndc_description';
+    p[`conditions[${i}][operator]`] = 'contains';
+    p[`conditions[${i}][value]`] = opts.name.toUpperCase();
+    i++;
+  }
+  if (opts.asOf) {
+    p[`conditions[${i}][property]`] = 'effective_date';
+    p[`conditions[${i}][operator]`] = '<=';
+    p[`conditions[${i}][value]`] = opts.asOf;
+  }
+  const r = await nadacQuery(ds.id, p);
+  return (r?.results ?? []).map(compactNadac);
+}
 
 async function nadacPrice(args: Record<string, unknown>) {
   const limit = clamp(args.limit, 20, 100);
@@ -951,53 +1137,59 @@ async function nadacPrice(args: Record<string, unknown>) {
   if (!rawNdc && !drug) return { error: 'provide `drug` (a name) or `ndc`' };
 
   const ds = await resolveNadacDataset();
-  const p: Record<string, string> = {
-    // Over-fetch: one NDC has many weeks, so `limit` results would all be the
-    // same product. Pull a deep sorted slice and reduce to the newest week here.
-    limit: '500',
-    'sorts[0][property]': 'effective_date',
-    'sorts[0][order]': 'desc',
-  };
-  let i = 0;
+
+  let all: any[] = [];
+  let searchedFor = rawNdc ? normalizeNdc(rawNdc) ?? rawNdc : drug.toUpperCase();
+  let resolved: { via: 'rxnorm_brand' | 'rxnorm_ingredient' | 'suffix_stripped'; term: string } | null = null;
+
   if (rawNdc) {
     const ndc = normalizeNdc(rawNdc);
     if (!ndc) return { error: `could not parse "${rawNdc}" as an NDC; expected 11-digit, dashed 5-4-2, or 10-digit` };
-    p[`conditions[${i}][property]`] = 'ndc';
-    p[`conditions[${i}][operator]`] = '=';
-    p[`conditions[${i}][value]`] = ndc;
-    i++;
+    all = await queryNadacTerm(ds, { ndc, asOf });
   } else {
-    p[`conditions[${i}][property]`] = 'ndc_description';
-    p[`conditions[${i}][operator]`] = 'contains';
-    p[`conditions[${i}][value]`] = drug.toUpperCase();
-    i++;
-  }
-  if (asOf) {
-    p[`conditions[${i}][property]`] = 'effective_date';
-    p[`conditions[${i}][operator]`] = '<=';
-    p[`conditions[${i}][value]`] = asOf;
+    all = await queryNadacTerm(ds, { name: drug, asOf });
+    // GENERIC<->BRAND CROSSWALK (fleet #3057): NADAC lists brand products
+    // under the brand name and generics under the ingredient name, so a
+    // literal substring search on the "wrong" one of the two returns a
+    // confident, empty "no match" for a drug that is right there under its
+    // other name. Only spend the crosswalk call when the direct hit missed.
+    if (!all.length) {
+      const { candidates, brands } = await nameCandidates(drug);
+      for (const cand of candidates) {
+        const rows = await queryNadacTerm(ds, { name: cand, asOf });
+        if (rows.length) {
+          all = rows;
+          searchedFor = cand.toUpperCase();
+          resolved = { via: brands.some((b) => b.toLowerCase() === cand.toLowerCase()) ? 'rxnorm_brand' : 'rxnorm_ingredient', term: cand };
+          break;
+        }
+      }
+    }
   }
 
-  const r = await nadacQuery(ds.id, p);
-  const all = (r?.results ?? []).map(compactNadac);
   if (!all.length) {
     return {
       benchmark: 'NADAC — National Average Drug Acquisition Cost (what a retail pharmacy pays a wholesaler)',
       source: 'CMS, data.medicaid.gov, published weekly',
       dataset: ds.title,
       count: 0,
+      found: false,
       // Do NOT assert a reason here. The obvious explanation — "not a retail
       // drug" — is wrong for the single most common cause, which is that NADAC
       // names BRAND products by their BRAND: "APIXABAN" matches 0 rows while
       // "ELIQUIS" matches 204. Stating the clinic-administered reason as fact
       // would be a confident wrong answer about a drug that is right there.
+      // A brand<->generic crosswalk (RxNorm) was already tried and ALSO found
+      // nothing to retry with, so this really is unmatched, not just unlucky
+      // naming.
       note:
-        `Nothing matched ${rawNdc ? `NDC ${rawNdc}` : `"${drug}"`} anywhere in "${ds.title}". ` +
+        `Nothing matched ${rawNdc ? `NDC ${rawNdc}` : `"${drug}"`} anywhere in "${ds.title}", including after checking its brand/generic names via RxNorm. ` +
         (rawNdc
           ? 'Check the NDC — NADAC covers retail outpatient products only, so a clinic-administered drug will not appear.'
-          : 'Two common reasons, in order of likelihood: (1) NADAC lists BRAND products under their BRAND name and generics under the ingredient name, so searching "apixaban" returns nothing while "Eliquis" returns 204 rows — try the other name; (2) the drug is clinic-administered (most oncology and infused biologics), which have no retail NADAC and are priced by asp_payment_limit instead.'),
-      searched_for: rawNdc ? normalizeNdc(rawNdc) : drug.toUpperCase(),
+          : 'Most likely the drug is clinic-administered (most oncology and infused biologics), which have no retail NADAC and are priced by asp_payment_limit instead.'),
+      searched_for: searchedFor,
       prices: [],
+      empty_reason: 'no_match',
     };
   }
 
@@ -1014,6 +1206,14 @@ async function nadacPrice(args: Record<string, unknown>) {
     dataset: ds.title,
     pricing_week: week,
     ...(asOf ? { as_of_requested: asOf } : {}),
+    found: true,
+    ...(resolved
+      ? {
+          resolved_via: resolved.via,
+          resolved_term: resolved.term,
+          note: `"${drug}" matched via "${resolved.term}" (${resolved.via === 'rxnorm_brand' ? 'its RxNorm brand name' : 'its RxNorm ingredient name'}) — NADAC lists this product under that name instead.`,
+        }
+      : {}),
     distinct_ndcs_this_week: seen.size,
     count: rows.length,
     prices: rows,
@@ -1133,19 +1333,80 @@ async function aspPaymentLimit(args: Record<string, unknown>) {
     if (!quarter) return { error: 'no ASP quarters loaded' };
   }
 
-  const filter = hcpcs
-    ? `hcpcs=eq.${encodeURIComponent(hcpcs)}`
-    : `short_description=ilike.${encodeURIComponent(`*${drug}*`)}`;
-  const rows = await pg(args, `asp_payment_limits?${filter}&effective_quarter=eq.${quarter}&select=*&order=hcpcs.asc&limit=${limit}`);
+  const nameFilter = (term: string) => `short_description=ilike.${encodeURIComponent(`*${term}*`)}`;
+  const filter = hcpcs ? `hcpcs=eq.${encodeURIComponent(hcpcs)}` : nameFilter(drug);
+  let rows = await pg(args, `asp_payment_limits?${filter}&effective_quarter=eq.${quarter}&select=*&order=hcpcs.asc&limit=${limit}`);
+
+  // GENERIC<->BRAND CROSSWALK (fleet #3057): the HCPCS short_description for a
+  // newer biologic is often the BRAND name alone — "Inj, elahere, 1 mg" has no
+  // "mirvetuximab" anywhere in it — the mirror image of the NADAC brand/generic
+  // trap below. A name search that misses in the current quarter is retried
+  // against RxNorm's brand/ingredient names for the same term BEFORE falling
+  // back to the hcpcs lookup. Skipped entirely when the caller searched by
+  // hcpcs — that is an exact code match, not a name-matching problem.
+  let resolved: { via: 'rxnorm_brand' | 'rxnorm_ingredient' | 'suffix_stripped'; term: string } | null = null;
+  let triedTerms = [drug];
+  if (!hcpcs && !rows.length) {
+    const { candidates, brands } = await nameCandidates(drug);
+    triedTerms = [drug, ...candidates];
+    for (const cand of candidates) {
+      const candRows = await pg(args, `asp_payment_limits?${nameFilter(cand)}&effective_quarter=eq.${quarter}&select=*&order=hcpcs.asc&limit=${limit}`);
+      if (candRows.length) {
+        rows = candRows;
+        resolved = {
+          via: candidates.indexOf(cand) === 0 && cand === stripBiologicSuffix(drug) ? 'suffix_stripped' : brands.some((b) => b.toLowerCase() === cand.toLowerCase()) ? 'rxnorm_brand' : 'rxnorm_ingredient',
+          term: cand,
+        };
+        break;
+      }
+    }
+  }
 
   if (!rows.length) {
-    const anyQ = await pg(args, `asp_payment_limits?${filter}&select=effective_quarter&order=effective_quarter.desc&limit=4`);
+    // Check every term tried (original + crosswalk candidates) for a match in
+    // ANY quarter, not just the current one — a code that is only off by
+    // quarter should say so rather than read as "doesn't exist".
+    let anyQ: any[] = [];
+    let anyQTerm = drug;
+    for (const term of triedTerms) {
+      const f = hcpcs ? filter : nameFilter(term);
+      anyQ = await pg(args, `asp_payment_limits?${f}&select=effective_quarter&order=effective_quarter.desc&limit=4`);
+      if (anyQ.length) { anyQTerm = term; break; }
+    }
+    if (anyQ.length) {
+      return {
+        benchmark: 'Medicare Part B ASP payment limit',
+        quarter, count: 0, found: false,
+        note:
+          `Nothing for ${hcpcs || drug} in the quarter beginning ${quarter}, but it does appear in: ${[...new Set(anyQ.map((x: any) => x.effective_quarter))].join(', ')}. Pass one of those as \`quarter\`.` +
+          (anyQTerm !== drug ? ` (matched via "${anyQTerm}".)` : ''),
+        limits: [],
+      };
+    }
+
+    // Still nothing anywhere, even after the crosswalk. Distinguish "genuinely
+    // not Part B" from "we just can't find it": if the SAME drug (or any of
+    // its crosswalk names) turns up in NADAC, it is dispensed at retail — a
+    // self-administered / Part D product — and that is a real, explicit
+    // reason, not a bare 0. nadac_price runs its own crosswalk internally too,
+    // so passing the original term is enough.
+    let selfAdministered = false;
+    if (!hcpcs) {
+      try {
+        const nadacCheck = await nadacPrice({ drug, limit: 1 });
+        selfAdministered = Array.isArray((nadacCheck as any)?.prices) && (nadacCheck as any).prices.length > 0;
+      } catch { /* best-effort signal; absence of it just means a plainer note below */ }
+    }
+
     return {
       benchmark: 'Medicare Part B ASP payment limit',
-      quarter, count: 0,
-      note: anyQ.length
-        ? `Nothing for ${hcpcs || drug} in the quarter beginning ${quarter}, but it does appear in: ${[...new Set(anyQ.map((x: any) => x.effective_quarter))].join(', ')}. Pass one of those as \`quarter\`.`
-        : `${hcpcs || drug} has no Part B payment limit in any loaded quarter. Part B covers provider-administered drugs; a retail pharmacy product is priced by nadac_price instead.`,
+      quarter, count: 0, found: false,
+      self_administered: selfAdministered || undefined,
+      not_part_b: selfAdministered || undefined,
+      note: selfAdministered
+        ? `${hcpcs || drug} is self-administered (dispensed at a retail pharmacy, typically billed under Part D) rather than provider-administered, so it has no Medicare Part B ASP payment limit. See nadac_price for its retail acquisition cost.`
+        : `${hcpcs || drug} has no Part B payment limit in any loaded quarter, including after checking its brand/generic names via RxNorm. Part B covers provider-administered drugs; a retail pharmacy product is priced by nadac_price instead.`,
+      ...(selfAdministered ? { retail_price_hint: { tool: 'nadac_price', args: { drug } } } : {}),
       limits: [],
     };
   }
@@ -1153,6 +1414,14 @@ async function aspPaymentLimit(args: Record<string, unknown>) {
     benchmark: 'Medicare Part B ASP payment limit — 106% of manufacturer-reported Average Sales Price, per statute',
     source: 'CMS ASP Pricing Files (quarterly)',
     quarter_in_force: quarter,
+    found: true,
+    ...(resolved
+      ? {
+          resolved_via: resolved.via,
+          resolved_term: resolved.term,
+          note: `"${drug}" matched via "${resolved.term}" (${resolved.via === 'suffix_stripped' ? 'its name with the biosimilar suffix stripped' : resolved.via === 'rxnorm_brand' ? 'its RxNorm brand name' : 'its RxNorm ingredient name'}) — the CMS descriptor uses that name instead.`,
+        }
+      : {}),
     derived_from_asp_data: rows[0].asp_data_quarter,
     vintage_note: rows[0].asp_data_quarter
       ? `The limit in force this quarter is computed from ${rows[0].asp_data_quarter} ASP data — roughly two quarters earlier. Comparing it with a current NADAC price spans that gap.`
