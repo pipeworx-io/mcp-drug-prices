@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-drug-prices",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "US drug price benchmarks — what a pharmacy PAYS and what Medicare PAYS OUT.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-drug-prices": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "drug-prices"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-drug-prices.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/drug-prices",
   "pipeworx": {
-    "sourceHash": "v1-0f6ab51b3afee04f07125d4a2ff6dd46b1ea6c7e9e4961a7c6a503ad858155da",
-    "sourceCommit": "29fb434ca65fe0f61191f19c3502f583f5fb99d7"
+    "mode": "gateway",
+    "slug": "drug-prices",
+    "gatewaySlug": "drug-prices",
+    "sourceHash": "v1-6023a791b0be357b1795553957deab5af54134fd0081c6ede1c2ae9ecc10ee84",
+    "sourceCommit": "0b3faaa4d85299a961dd86dea75a0f0e1dad280c"
   }
 }
