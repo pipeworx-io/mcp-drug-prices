@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-drug-prices",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "US drug price benchmarks — what a pharmacy PAYS and what Medicare PAYS OUT.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "drug-prices",
     "gatewaySlug": "drug-prices",
-    "sourceHash": "v1-6023a791b0be357b1795553957deab5af54134fd0081c6ede1c2ae9ecc10ee84",
-    "sourceCommit": "0b3faaa4d85299a961dd86dea75a0f0e1dad280c"
+    "sourceHash": "v1-66231f6bc3af5c790d5e988107ec24ca14bf88f0099a88e9db698e73b858da8d",
+    "sourceCommit": "e707a4bb6209f432984c0a83bf64b3138130db89"
   }
 }
